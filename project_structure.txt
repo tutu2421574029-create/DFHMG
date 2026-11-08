@@ -1,0 +1,125 @@
+.
+├── Dockerfile
+├── README.md
+├── __pycache__
+│   ├── augmentation.cpython-310.pyc
+│   ├── contrastive_loss.cpython-310.pyc
+│   └── pretrain.cpython-310.pyc
+├── data -> /root/autodl-tmp/data
+├── dataset
+│   ├── __pycache__
+│   │   ├── mesh_dataset.cpython-310.pyc
+│   │   └── preprocessing.cpython-310.pyc
+│   ├── mesh_dataset.py
+│   └── preprocessing.py
+├── images
+│   ├── graphical_abstract.jpg
+│   ├── image18.gif
+│   ├── image20.gif
+│   └── teeth_numbering_color_code.PNG
+├── lightning_logs
+│   ├── version_0
+│   │   ├── events.out.tfevents.1765606670.autodl-container-59db4f87a9-a5ab7691.3950.0
+│   │   └── hparams.yaml
+│   ├── version_1
+│   │   ├── events.out.tfevents.1765608490.autodl-container-59db4f87a9-a5ab7691.7306.0
+│   │   └── hparams.yaml
+│   ├── version_10
+│   │   ├── events.out.tfevents.1765682001.autodl-container-59db4f87a9-a5ab7691.77114.0
+│   │   └── hparams.yaml
+│   ├── version_11
+│   │   ├── events.out.tfevents.1765684356.autodl-container-59db4f87a9-a5ab7691.104863.0
+│   │   └── hparams.yaml
+│   ├── version_12
+│   │   ├── events.out.tfevents.1765685793.autodl-container-59db4f87a9-a5ab7691.114465.0
+│   │   └── hparams.yaml
+│   ├── version_13
+│   │   ├── events.out.tfevents.1765685906.autodl-container-59db4f87a9-a5ab7691.114849.0
+│   │   └── hparams.yaml
+│   ├── version_2
+│   │   ├── events.out.tfevents.1765634173.autodl-container-59db4f87a9-a5ab7691.1492.0
+│   │   └── hparams.yaml
+│   ├── version_3
+│   │   ├── events.out.tfevents.1765634311.autodl-container-59db4f87a9-a5ab7691.1895.0
+│   │   └── hparams.yaml
+│   ├── version_4
+│   │   ├── events.out.tfevents.1765636283.autodl-container-59db4f87a9-a5ab7691.29421.0
+│   │   └── hparams.yaml
+│   ├── version_5
+│   │   ├── events.out.tfevents.1765641844.autodl-container-59db4f87a9-a5ab7691.2331.0
+│   │   └── hparams.yaml
+│   ├── version_6
+│   │   ├── events.out.tfevents.1765644252.autodl-container-59db4f87a9-a5ab7691.30634.0
+│   │   └── hparams.yaml
+│   ├── version_7
+│   │   ├── events.out.tfevents.1765644379.autodl-container-59db4f87a9-a5ab7691.31031.0
+│   │   └── hparams.yaml
+│   ├── version_8
+│   │   ├── events.out.tfevents.1765652038.autodl-container-59db4f87a9-a5ab7691.40485.0
+│   │   └── hparams.yaml
+│   └── version_9
+│       ├── events.out.tfevents.1765681835.autodl-container-59db4f87a9-a5ab7691.76265.0
+│       └── hparams.yaml
+├── models
+│   ├── __pycache__
+│   │   ├── DFHMG-Network.cpython-310.pyc
+│   │   └── layer.cpython-310.pyc
+│   ├── DFHMG-Network.py
+│   └── layer.py
+├── pointnet2_ops_lib
+│   ├── MANIFEST.in
+│   ├── build
+│   │   ├── bdist.linux-x86_64
+│   │   ├── lib.linux-x86_64-cpython-310
+│   │   └── temp.linux-x86_64-cpython-310
+│   ├── pointnet2_ops
+│   │   ├── __init__.py
+│   │   ├── _ext-src
+│   │   ├── _ext.cpython-310-x86_64-linux-gnu.so
+│   │   ├── _version.py
+│   │   ├── pointnet2_modules.py
+│   │   └── pointnet2_utils.py
+│   ├── pointnet2_ops.egg-info
+│   │   ├── PKG-INFO
+│   │   ├── SOURCES.txt
+│   │   ├── dependency_links.txt
+│   │   ├── requires.txt
+│   │   └── top_level.txt
+│   └── setup.py
+├── project_structure.txt
+├── requirements.txt
+├── results
+│   └── results.csv
+├── saved_models
+│   ├── attention_best.ckpt
+│   ├── best_baseline.ckpt
+│   ├── full_best.ckpt
+│   └── structure_best.ckpt
+├── tensorboard_logs
+│   ├── attention_experiment
+│   │   └── version_0
+│   ├── attention_model_test
+│   │   ├── version_0
+│   │   ├── version_1
+│   │   ├── version_2
+│   │   ├── version_3
+│   │   ├── version_4
+│   │   ├── version_5
+│   │   └── version_6
+│   ├── full_model_experiment
+│   │   └── version_0
+│   ├── full_model_experiment_v2
+│   │   └── version_0
+│   └── structure_aware_experiment
+│       └── version_0
+├── test_network.py
+├── train_network.py
+├── utils
+│   ├── __pycache__
+│   │   ├── mesh_io.cpython-310.pyc
+│   │   └── teeth_numbering.cpython-310.pyc
+│   ├── mesh_io.py
+│   └── teeth_numbering.py
+└── visualize_example.py
+
+51 directories, 71 files

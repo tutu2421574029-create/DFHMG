@@ -1,0 +1,515 @@
+import torch
+
+import torch.nn as nn
+
+import torch.nn.functional as F
+
+
+
+from models.layer import (
+
+    BasicPointLayer, 
+
+    ResidualBasicPointLayer, 
+
+    PointFeatureImportance, 
+
+    STNkd,
+
+    get_graph_feature, 
+
+    fps, 
+
+    batched_index_select
+
+)
+
+
+
+class OursEdgeGraphConvBlock(nn.Module):
+
+    def __init__(self, in_channels, hidden_channels, out_channels, edge_function, k=32, use_mm=True):
+
+        super(OursEdgeGraphConvBlock, self).__init__()
+
+        self.edge_function = edge_function
+
+        self.in_channels = in_channels
+
+        self.k = k
+
+        self.use_mm = use_mm # 消融开关：MM
+
+        
+
+        if edge_function not in ["global", "local", "local_global"]:
+
+            raise ValueError(f'Edge Function {edge_function} is not allowed.')
+
+        if edge_function == "local_global":
+
+            self.in_channels = self.in_channels * 2
+
+            
+
+        self.conv = nn.Sequential(
+
+            nn.Conv2d(self.in_channels, hidden_channels, kernel_size=1, bias=False),
+
+            nn.BatchNorm2d(hidden_channels, track_running_stats=False),
+
+            nn.LeakyReLU(negative_slope=0.2),
+
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=1, bias=False),
+
+            nn.BatchNorm2d(out_channels, track_running_stats=False),
+
+            nn.LeakyReLU(negative_slope=0.2)
+
+        )
+
+
+
+    def forward(self, x, pos=None, idx=None):
+
+        x_t = x.transpose(2, 1)
+
+        if pos is None:
+
+            pos = x
+
+        pos_t = pos.transpose(2, 1)
+
+        out, idx = get_graph_feature(x_t, edge_function=self.edge_function, k=self.k, idx=idx, pos=pos_t)
+
+        out = self.conv(out)
+
+        
+
+        if self.use_mm:
+
+            # 开启 Max-Mean 联合聚合
+
+            out_max = out.max(dim=-1, keepdim=False)[0] 
+
+            out_mean = out.mean(dim=-1, keepdim=False)  
+
+            out = out_max + out_mean                    
+
+        else:
+
+            # 退化为基础 Max Pooling
+
+            out = out.max(dim=-1, keepdim=False)[0]
+
+            
+
+        out = out.transpose(2, 1)
+
+        return out, idx
+
+
+
+class OursDilatedEdgeGraphConvBlock(nn.Module):
+
+    def __init__(self, in_channels, hidden_channels, out_channels, edge_function, dilation_k=128, k=32, use_mm=True):
+
+        super(OursDilatedEdgeGraphConvBlock, self).__init__()
+
+        self.edge_function = edge_function
+
+        self.in_channels = in_channels
+
+        self.dilation_k = dilation_k
+
+        self.k = k
+
+        self.use_mm = use_mm
+
+        
+
+        if dilation_k < k:
+
+            raise ValueError(f'Dilation k {dilation_k} must be larger than k {k}')
+
+        if edge_function not in ["global", "local", "local_global"]:
+
+            raise ValueError(f'Edge Function {edge_function} is not allowed.')
+
+        if edge_function in ["local_global"]:
+
+            self.in_channels = self.in_channels * 2
+
+            
+
+        self.conv = nn.Sequential(
+
+            nn.Conv2d(self.in_channels, hidden_channels, kernel_size=1, bias=False),
+
+            nn.BatchNorm2d(hidden_channels, track_running_stats=False),
+
+            nn.LeakyReLU(negative_slope=0.2),
+
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=1, bias=False),
+
+            nn.BatchNorm2d(out_channels, track_running_stats=False),
+
+            nn.LeakyReLU(negative_slope=0.2)
+
+        )
+
+
+
+    def forward(self, x, pos, cd=None):
+
+        x_t = x.transpose(2, 1)
+
+        B, N, C = x.shape
+
+        if cd is None:
+
+            cd = torch.cdist(pos, pos, p=2)
+
+            
+
+        dilation_k = min(self.dilation_k, N)
+
+        idx_l = torch.topk(cd, dilation_k, largest=False)[1].reshape(B * N, -1)
+
+        idx_fps = fps(pos.reshape(B * N, -1)[idx_l], self.k).long()
+
+        idx_fps = batched_index_select(idx_l, 1, idx_fps).reshape(B, N, -1)
+
+        out, idx = get_graph_feature(x_t, edge_function=self.edge_function, k=self.k, idx=idx_fps)
+
+        out = self.conv(out)
+
+        
+
+        if self.use_mm:
+
+            out_max = out.max(dim=-1, keepdim=False)[0] 
+
+            out_mean = out.mean(dim=-1, keepdim=False)  
+
+            out = out_max + out_mean                    
+
+        else:
+
+            out = out.max(dim=-1, keepdim=False)[0]
+
+            
+
+        out = out.transpose(2, 1)
+
+        return out, idx
+
+
+
+class OursDualPathDilatedGCN(nn.Module):
+
+    def __init__(self, in_channels, out_channels, k=32, dilation_k=400, use_mm=True):
+
+        super(OursDualPathDilatedGCN, self).__init__()
+
+        half_out = out_channels // 2
+
+        
+
+        self.local_path = OursEdgeGraphConvBlock(
+
+            in_channels=in_channels, hidden_channels=half_out, 
+
+            out_channels=half_out, edge_function="local_global", k=k, use_mm=use_mm
+
+        )
+
+        self.dilated_path = OursDilatedEdgeGraphConvBlock(
+
+            in_channels=in_channels, hidden_channels=half_out, 
+
+            out_channels=half_out, k=k, dilation_k=dilation_k, 
+
+            edge_function="local_global", use_mm=use_mm
+
+        )
+
+        
+
+        self.fusion = nn.Sequential(
+
+            nn.Conv1d(half_out * 2, out_channels, kernel_size=1, bias=False),
+
+            nn.BatchNorm1d(out_channels),
+
+            nn.LeakyReLU(negative_slope=0.2)
+
+        )
+
+        
+
+        self.gate = nn.Sequential(
+
+            nn.Conv1d(out_channels, out_channels // 2, kernel_size=1, bias=False),
+
+            nn.BatchNorm1d(out_channels // 2),
+
+            nn.ReLU(inplace=True),
+
+            nn.Conv1d(out_channels // 2, out_channels, kernel_size=1, bias=False),
+
+            nn.Sigmoid()
+
+        )
+
+        
+
+        self.shortcut = nn.Identity() if in_channels == out_channels else nn.Conv1d(in_channels, out_channels, 1)
+
+
+
+    def forward(self, x, pos, cd=None):
+
+        l_out, _ = self.local_path(x, pos)
+
+        d_out, _ = self.dilated_path(x, pos, cd=cd)
+
+        
+
+        fused = torch.cat([l_out, d_out], dim=2).transpose(2, 1)
+
+        out = self.fusion(fused)
+
+        gate_weights = self.gate(out)
+
+        out = out * gate_weights
+
+        
+
+        res = self.shortcut(x.transpose(2, 1))
+
+        out = out + res
+
+        return out.transpose(2, 1)
+
+
+
+class OursDualDomainAttention(nn.Module):
+
+    def __init__(self, channels):
+
+        super(OursDualDomainAttention, self).__init__()
+
+        self.channel_mlp = nn.Sequential(
+
+            nn.Linear(channels, channels // 4, bias=False),
+
+            nn.ReLU(inplace=True),
+
+            nn.Linear(channels // 4, channels, bias=False)
+
+        )
+
+        self.spatial_conv = nn.Sequential(
+
+            nn.Conv1d(2, 1, kernel_size=1, bias=False),
+
+            nn.Sigmoid()
+
+        )
+
+
+
+    def forward(self, x):
+
+        B, N, C = x.shape
+
+        avg_pool = x.mean(dim=1) 
+
+        max_pool = x.max(dim=1)[0]
+
+        c_weight = torch.sigmoid(self.channel_mlp(avg_pool) + self.channel_mlp(max_pool)).unsqueeze(1)
+
+        x_c = x * c_weight
+
+        
+
+        x_trans = x_c.transpose(2, 1)
+
+        s_avg_out = torch.mean(x_trans, dim=1, keepdim=True)
+
+        s_max_out = torch.max(x_trans, dim=1, keepdim=True)[0]
+
+        s_in = torch.cat([s_avg_out, s_max_out], dim=1) 
+
+        
+
+        s_weight = self.spatial_conv(s_in) 
+
+        x_out = x_trans * s_weight
+
+        return x_out.transpose(2, 1) + x
+
+
+
+
+
+class OursNetSeg(nn.Module):
+
+    def __init__(self, num_classes=17, feature_dim=24, 
+
+                 use_mm=True, use_dp=True, use_da=True, use_rf=True,
+
+                 dilation_k1=300, dilation_k2=600):
+
+        super(OursNetSeg, self).__init__()
+
+        self.num_classes = num_classes
+
+        self.use_rf = use_rf
+
+        self.use_da = use_da
+
+        self.use_dp = use_dp
+
+
+
+        self.stnkd = STNkd(k=24)
+
+
+
+        # Stage 1
+
+        self.local_conv1 = OursEdgeGraphConvBlock(in_channels=feature_dim, hidden_channels=32, out_channels=32, edge_function="local_global", k=32, use_mm=use_mm)
+
+        self.local_conv2 = OursEdgeGraphConvBlock(in_channels=32, hidden_channels=32, out_channels=64, edge_function="local_global", k=32, use_mm=use_mm)
+
+
+
+        # Stage 2: 消融 DP
+
+        if self.use_dp:
+
+            self.dp_dilated1 = OursDualPathDilatedGCN(in_channels=64, out_channels=64, k=32, dilation_k=dilation_k1, use_mm=use_mm)
+
+            self.dp_dilated2 = OursDualPathDilatedGCN(in_channels=64, out_channels=64, k=32, dilation_k=dilation_k2, use_mm=use_mm)
+
+        else:
+
+            self.dp_dilated1 = OursDilatedEdgeGraphConvBlock(in_channels=64, hidden_channels=64, out_channels=64, k=32, dilation_k=dilation_k1, edge_function="local_global", use_mm=use_mm)
+
+            self.dp_dilated2 = OursDilatedEdgeGraphConvBlock(in_channels=64, hidden_channels=64, out_channels=64, k=32, dilation_k=dilation_k2, edge_function="local_global", use_mm=use_mm)
+
+
+
+        # Stage 3
+
+        self.sem_bottleneck = BasicPointLayer(in_channels=64, out_channels=32, dropout=0.0)
+
+        self.semantic_graph_conv = OursEdgeGraphConvBlock(in_channels=64, hidden_channels=128, out_channels=128, edge_function="local_global", k=32, use_mm=use_mm)
+
+
+
+        # Stage 4: 消融 DA
+
+        if self.use_da:
+
+            self.dual_domain_attn = OursDualDomainAttention(channels=128)
+
+
+
+        # Stage 5: 消融 RF，动态计算通道维度
+
+        fusion_dim = 64 + 64 + 128
+
+        if self.use_rf:
+
+            self.raw_mapper = BasicPointLayer(in_channels=feature_dim, out_channels=64, dropout=0.0)
+
+            fusion_dim += 64
+
+            
+
+        self.dense_fusion = BasicPointLayer(in_channels=fusion_dim, out_channels=256, dropout=0.3)
+
+
+
+        # Stage 6
+
+        self.feature_importance = PointFeatureImportance(in_channels=256)
+
+        self.res_block1 = ResidualBasicPointLayer(in_channels=256, hidden_channels=128, out_channels=128, dropout=0.4)
+
+        self.res_block2 = ResidualBasicPointLayer(in_channels=128, hidden_channels=64, out_channels=64, dropout=0.4)
+
+        self.out = BasicPointLayer(in_channels=64, out_channels=num_classes, is_out=True)
+
+
+
+    def forward(self, x, pos):
+
+        cd_pos = torch.cdist(pos, pos)
+
+        x_aligned = self.stnkd(x)
+
+
+
+        l1, _ = self.local_conv1(x_aligned, pos)
+
+        l2, _ = self.local_conv2(l1, pos)
+
+
+
+        # 核心修复：兼容不同模块返回类型的解包
+
+        if self.use_dp:
+
+            d1 = self.dp_dilated1(l2, pos, cd=cd_pos)
+
+            d2 = self.dp_dilated2(d1, pos, cd=cd_pos)
+
+        else:
+
+            d1, _ = self.dp_dilated1(l2, pos, cd=cd_pos)
+
+            d2, _ = self.dp_dilated2(d1, pos, cd=cd_pos)
+
+
+
+        x_sem_pos = self.sem_bottleneck(d2)
+
+        x_sem, _ = self.semantic_graph_conv(d2, pos=x_sem_pos)
+
+
+
+        x_attn = self.dual_domain_attn(x_sem) if self.use_da else x_sem
+
+
+
+        fusion_list = [l2, d2, x_attn]
+
+        if self.use_rf:
+
+            x_aligned_mapped = self.raw_mapper(x_aligned)
+
+            fusion_list.append(x_aligned_mapped)
+
+            
+
+        x_fused = torch.cat(fusion_list, dim=2)
+
+        x_fused = self.dense_fusion(x_fused)
+
+
+
+        x_fused = self.feature_importance(x_fused)
+
+        x_fused = self.res_block1(x_fused)
+
+        x_fused = self.res_block2(x_fused)
+
+        out = self.out(x_fused)
+
+
+
+        return out

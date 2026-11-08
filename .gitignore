@@ -1,0 +1,23 @@
+# 屏蔽子文件夹内部的 Python 缓存与 C++ 编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.ipynb_checkpoints/
+
+# 屏蔽实验结果、模型权重与未公开脚本
+data/
+lightning_logs/
+predictions/
+results/
+saved_models/
+tensorboard_logs/
+vis_compare_1to8/
+*-Copy*.py
+*_network.py
+visualize_1to8.py
+常用代码.txt
+run_all.sh

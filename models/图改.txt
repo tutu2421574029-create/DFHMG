@@ -1,0 +1,307 @@
+from torch import nn
+import torch
+import torchmetrics as tm
+from models.layer import BasicPointLayer, EdgeGraphConvBlock, DilatedEdgeGraphConvBlock, ResidualBasicPointLayer, \
+    PointFeatureImportance, STNkd
+import lightning as L
+import torch.nn.functional as F
+
+# ==========================================
+# [创新点] 新增的自注意力模块
+# ==========================================
+
+#这就是 Graph Transformer 的标准组件
+class StructureAwareGraphSelfAttention(nn.Module):
+    def __init__(self, in_channels, hidden_channels=None):
+        """
+        [创新点 2.0] 结构感知型图注意力机制 (Structure-Aware Graph Self-Attention)
+        引入显式的 3D 坐标位置编码 (Positional Encoding)，模拟牙弓序列先验。
+        """
+        super(StructureAwareGraphSelfAttention, self).__init__()
+        if hidden_channels is None:
+            hidden_channels = in_channels // 4
+        
+        self.q_conv = nn.Linear(in_channels, hidden_channels)
+        self.k_conv = nn.Linear(in_channels, hidden_channels)
+        self.v_conv = nn.Linear(in_channels, in_channels)
+        
+        # [新增] 位置编码网络 (Positional Encoding MLP)
+        # 将 (x,y,z) 3维坐标 映射为 与特征向量维度一致的 位置向量
+        self.pos_encoder = nn.Sequential(
+            nn.Linear(3, hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, hidden_channels)
+        )
+        
+        self.scale = 1.0 / (hidden_channels ** 0.5)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, pos):
+        """
+        Args:
+            x: 特征矩阵 [B, N, C]
+            pos: 原始坐标矩阵 [B, N, 3] (这就是结构先验的来源)
+        """
+        B, N, C = x.shape
+        
+        # 1. 计算基础的 Q, K, V
+        q = self.q_conv(x)  # [B, N, H]
+        k = self.k_conv(x)  # [B, N, H]
+        v = self.v_conv(x)  # [B, N, C]
+        
+        # 2. [关键创新] 生成结构位置编码 (Structural Positional Encoding)
+        # pos 是输入的 (x,y,z) 坐标，代表牙齿在牙弓上的绝对位置
+        pe = self.pos_encoder(pos)  # [B, N, H]
+        
+        # 3. 将位置信息注入到 Query 和 Key 中
+        # 这样 Attention 在计算相似度时，不仅看“特征像不像”，还看“位置对不对”
+        q = q + pe
+        k = k + pe
+        
+        # 4. 标准的 Attention 计算
+        energy = torch.bmm(q, k.transpose(1, 2)) * self.scale
+        attention = self.softmax(energy)
+        
+        out = torch.bmm(attention, v)
+        out = self.gamma * out + x
+        return out
+
+# ==========================================
+# 修改后的主网络
+# ==========================================
+class DilatedToothSegmentationNetwork(nn.Module):
+    def __init__(self, num_classes=17, feature_dim=24):
+        """
+        :param num_classes: Number of classes to predict
+        """
+        super(DilatedToothSegmentationNetwork, self).__init__()
+        self.num_classes = num_classes
+
+        self.stnkd = STNkd(k=24)
+
+        # Local Feature Learning
+        self.edge_graph_conv_block1 = EdgeGraphConvBlock(in_channels=feature_dim, out_channels=24, k=32,
+                                                         hidden_channels=24,
+                                                         edge_function="local_global")
+        self.edge_graph_conv_block2 = EdgeGraphConvBlock(in_channels=24, out_channels=24, k=32,
+                                                         hidden_channels=24,
+                                                         edge_function="local_global")
+        self.edge_graph_conv_block3 = EdgeGraphConvBlock(in_channels=24, out_channels=24, k=32,
+                                                         hidden_channels=24,
+                                                         edge_function="local_global")
+
+        self.local_hidden_layer = BasicPointLayer(in_channels=24 * 3, out_channels=60)
+
+        # Dilated Feature Learning (Global Context)
+        self.dilated_edge_graph_conv_block1 = DilatedEdgeGraphConvBlock(in_channels=60, hidden_channels=60,
+                                                                        out_channels=60, k=32,
+                                                                        dilation_k=200, edge_function="local_global")
+        self.dilated_edge_graph_conv_block2 = DilatedEdgeGraphConvBlock(in_channels=60, hidden_channels=60,
+                                                                        out_channels=60, k=32,
+                                                                        dilation_k=900, edge_function="local_global")
+        self.dilated_edge_graph_conv_block3 = DilatedEdgeGraphConvBlock(in_channels=60, hidden_channels=60,
+                                                                        out_channels=60, k=32,
+                                                                        dilation_k=1800, edge_function="local_global")
+
+        # [创新点] 初始化自注意力层
+        # 输入维度计算: dilated block之前的 x(60) + 3个dilated block输出(60*3) = 240
+        #self.self_attention = GraphSelfAttention(in_channels=240, hidden_channels=60)
+
+        # 在 DilatedToothSegmentationNetwork 类的 __init__ 中：
+        # 将 self.attention = GraphSelfAttention(...) 改为：
+        self.attention = StructureAwareGraphSelfAttention(60 * 4) # 维度根据你之前的设置调整
+        
+        self.global_hidden_layer = BasicPointLayer(in_channels=60 * 4, out_channels=1024)
+
+        self.feature_importance = PointFeatureImportance(in_channels=1024)
+
+        self.res_block1 = ResidualBasicPointLayer(in_channels=1024, out_channels=512, hidden_channels=512)
+        self.res_block2 = ResidualBasicPointLayer(in_channels=512, out_channels=256, hidden_channels=256)
+        
+        self.out = BasicPointLayer(in_channels=256, out_channels=num_classes, is_out=True)
+
+    def forward(self, x, pos):
+        # precompute pairwise distance of points
+        cd = torch.cdist(pos, pos)
+        x = self.stnkd(x)
+
+        # Local Conv
+        x1, _ = self.edge_graph_conv_block1(x, pos)
+        x2, _ = self.edge_graph_conv_block2(x1)
+        x3, _ = self.edge_graph_conv_block3(x2)
+
+        x = torch.cat([x1, x2, x3], dim=2)
+        x = self.local_hidden_layer(x)
+
+        # Dilated Conv
+        x1, _ = self.dilated_edge_graph_conv_block1(x, pos, cd=cd)
+        x2, _ = self.dilated_edge_graph_conv_block2(x1, pos, cd=cd)
+        x3, _ = self.dilated_edge_graph_conv_block3(x2, pos, cd=cd)
+
+        # Concatenate multi-scale features
+        x = torch.cat([x, x1, x2, x3], dim=2) # Shape: [B, N, 240]
+
+        # [创新点] 应用自注意力机制
+        # 在特征融合之后、降维之前，利用注意力机制细化特征
+        #x = self.self_attention(x)
+
+        x = self.attention(x, pos)
+
+        x = self.global_hidden_layer(x)
+
+        x = self.feature_importance(x)
+
+        x = self.res_block1(x)
+        x = self.res_block2(x)
+        x = self.out(x)
+        return x
+    
+    
+
+# ==========================================
+# [创新点 3.0] 边界增强损失函数 (Boundary Enhancement)
+# ==========================================
+class DiceLoss(nn.Module):
+    def __init__(self, num_classes, smooth=1e-5):
+        super(DiceLoss, self).__init__()
+        self.num_classes = num_classes
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        # pred: [B, C, N] (logits)
+        # target: [B, N] (indices)
+        
+        # 1. Apply Softmax to get probabilities
+        pred_softmax = torch.softmax(pred, dim=1)
+        
+        # 2. One-hot encode target
+        # target shape: [B, N] -> [B, N, C]
+        target_one_hot = torch.nn.functional.one_hot(target.long(), num_classes=self.num_classes)
+        target_one_hot = target_one_hot.permute(0, 2, 1).float() # [B, C, N]
+        
+        # 3. Calculate Dice for each class
+        intersection = (pred_softmax * target_one_hot).sum(dim=2)
+        union = pred_softmax.sum(dim=2) + target_one_hot.sum(dim=2)
+        
+        # Dice Score per class per batch
+        dice_score = (2. * intersection + self.smooth) / (union + self.smooth)
+        
+        # 4. Average Dice Loss (1 - Dice) across classes and batch
+        return 1 - dice_score.mean()
+
+
+# ==========================================
+# 终极版 Lightning Module (含 Dice Loss)
+# ==========================================
+class LitDilatedToothSegmentationNetwork(L.LightningModule):
+    def __init__(self):
+        super().__init__()
+        # 注意：这里要确保 feature_dim 和之前的设置一致
+        self.model = DilatedToothSegmentationNetwork(num_classes=17, feature_dim=24)
+        
+        # [Loss 1] 交叉熵损失 (关注分类准确性)
+        self.ce_loss = nn.CrossEntropyLoss()
+        
+        # [Loss 2] Dice 损失 (关注形状重合度/边界)
+        self.dice_loss = DiceLoss(num_classes=17)
+        
+        # 定义指标
+        self.train_acc = tm.Accuracy(task="multiclass", num_classes=17)
+        self.val_acc = tm.Accuracy(task="multiclass", num_classes=17)
+        self.train_miou = tm.JaccardIndex(task="multiclass", num_classes=17)
+        self.val_miou = tm.JaccardIndex(task="multiclass", num_classes=17)
+        
+        # 测试指标
+        self.test_dice = tm.F1Score(task="multiclass", num_classes=17, average='macro')
+        self.test_class_acc = tm.Accuracy(task="multiclass", num_classes=17, average='none')
+        
+        self.save_hyperparameters()
+
+    def training_step(self, batch, batch_idx):
+        pos, x, y = batch
+        
+        # Forward pass
+        pred = self.model(x, pos)
+        pred = pred.transpose(2, 1)
+        
+        # [核心修改] 计算混合损失 (Compound Loss)
+        loss_ce = self.ce_loss(pred, y.long())
+        loss_dice = self.dice_loss(pred, y.long())
+        
+        # 权重分配：1:1 混合
+        total_loss = loss_ce + loss_dice
+        
+        # 记录日志
+        self.train_acc(pred, y)
+        self.train_miou(pred, y)
+        self.log("train_ce", loss_ce, prog_bar=False, on_epoch=True)
+        self.log("train_dice", loss_dice, prog_bar=False, on_epoch=True)
+        self.log("train_loss", total_loss, prog_bar=True, on_epoch=True)
+        self.log("train_acc", self.train_acc, prog_bar=True, on_epoch=True)
+        self.log("train_miou", self.train_miou, prog_bar=True, on_epoch=True)
+        
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        pos, x, y = batch
+        pred  = self.model(x, pos)
+        pred = pred.transpose(2, 1)
+        
+        # 验证集也计算混合 loss 方便观察
+        loss_ce = self.ce_loss(pred, y.long())
+        loss_dice = self.dice_loss(pred, y.long())
+        total_loss = loss_ce + loss_dice
+        
+        self.val_acc(pred, y)
+        self.val_miou(pred, y)
+        
+        self.log("val_loss", total_loss, prog_bar=True, on_epoch=True)
+        self.log("val_acc", self.val_acc, prog_bar=True, on_epoch=True)
+        self.log("val_miou", self.val_miou, prog_bar=True, on_epoch=True)
+        return total_loss 
+    
+    # test_step, on_test_epoch_end, predict_labels, configure_optimizers 
+    # 这些函数保持和你之前的一模一样，不需要改动，直接保留即可。
+    # (为了节省篇幅，这里不重复粘贴，请保留原文件中的这些部分)
+    def test_step(self, batch, batch_idx):
+        pos, x, y = batch
+        pred = self.model(x, pos)
+        pred = pred.transpose(2, 1)
+        self.val_acc(pred, y)
+        self.val_miou(pred, y)
+        self.test_dice(pred, y)
+        self.test_class_acc(pred, y)
+        self.log("test_dice", self.test_dice, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_acc", self.val_acc, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_miou", self.val_miou, prog_bar=True, on_step=False, on_epoch=True)
+
+    def on_test_epoch_end(self):
+        class_acc = self.test_class_acc.compute()
+        class_names = [
+            "Gum", "Central Incisor (UL)", "Lateral Incisor (UL)", "Canine (UL)", "1st Premolar (UL)", "2nd Premolar (UL)", "1st Molar (UL)", "2nd Molar (UL)", "3rd Molar (UL)",
+            "Central Incisor (UR)", "Lateral Incisor (UR)", "Canine (UR)", "1st Premolar (UR)", "2nd Premolar (UR)", "1st Molar (UR)", "2nd Molar (UR)", "3rd Molar (UR)"
+        ]
+        print("\n" + "="*40)
+        print("PER-CLASS ACCURACY REPORT")
+        print("="*40)
+        for i, acc in enumerate(class_acc):
+            name = class_names[i] if i < len(class_names) else f"Class {i}"
+            print(f"{name:<25}: {acc.item()*100:.2f}%")
+        print("="*40 + "\n")
+
+    def predict_labels(self, data):
+        with torch.autocast(device_type="cuda" if self.device.type == "cuda" else "cpu"):
+            with torch.no_grad():
+                pos, x, y = data
+                pos = pos.unsqueeze(0).to(self.device)
+                x = x.unsqueeze(0).to(self.device)
+                pred = self.model(x, pos)
+                pred = pred.transpose(2, 1)
+                pred = torch.argmax(pred, dim=1)
+                return pred.squeeze()
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-5)
+        sch = torch.optim.lr_scheduler.StepLR(optimizer, step_size=60, gamma=0.5, verbose=True)
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": sch, "monitor": "train_loss"}}
